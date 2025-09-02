@@ -547,7 +547,7 @@ Outputs:
     Description: Zabbix Web URL
     Value: !Sub
       - '${Proto}://${DNS}'
-      - { Proto: !If [HasSSLCertificate, 'https', 'http'], DNS: !GetAtt ApplicationLoadBalancer.DNSName ] }
+      - { Proto: !If [HasSSLCertificate, 'https', 'http'], DNS: !GetAtt ApplicationLoadBalancer.DNSName }
 
   DatabaseEndpoint:
     Description: RDS endpoint

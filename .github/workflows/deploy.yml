@@ -20,7 +20,7 @@ on:
         options: [ dev, staging, prod ]
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
   PROJECT_NAME: zabbix
 
 jobs:
@@ -40,7 +40,7 @@ jobs:
             echo "environment=dev" >> $GITHUB_OUTPUT
           else
             echo "environment=dev" >> $GITHUB_OUTPUT
-          fi   # ✅ missing in your version
+          fi
 
   validate:
     needs: determine-environment

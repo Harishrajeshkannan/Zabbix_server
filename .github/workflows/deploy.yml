@@ -78,6 +78,26 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # 🔹 New step: delete stack if in ROLLBACK_COMPLETE
+      - name: Delete failed stack if in ROLLBACK_COMPLETE
+        run: |
+          set -e
+          ENV="${{ needs.determine-environment.outputs.environment }}"
+          STACK_NAME="${PROJECT_NAME}-${ENV}"
+
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "ROLLBACK_COMPLETE" ]; then
+            echo "Stack $STACK_NAME is in ROLLBACK_COMPLETE, deleting..."
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+          elif [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "Stack $STACK_NAME does not exist, safe to create."
+          else
+            echo "Stack $STACK_NAME exists in status $STATUS, proceeding..."
+          fi
+
       - name: Deploy CloudFormation stack
         id: deploy
         run: |

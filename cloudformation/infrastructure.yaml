@@ -80,7 +80,25 @@ Resources:
       AvailabilityZone: !Select [1, !GetAZs ""]
       MapPublicIpOnLaunch: false
 
+  # NAT Gateway for private subnets
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+
   PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
@@ -92,6 +110,13 @@ Resources:
       RouteTableId: !Ref PublicRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
 
   PublicSubnetARouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -105,11 +130,33 @@ Resources:
       SubnetId: !Ref PublicSubnetB
       RouteTableId: !Ref PublicRouteTable
 
-  # ---------------- ECS ----------------
-  ECSCluster:
-    Type: AWS::ECS::Cluster
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      ClusterName: !Sub '${ProjectName}-${Environment}-cluster'
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------- Security Groups ----------------
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
 
   ECSServiceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -120,11 +167,66 @@ Resources:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
-          CidrIp: 0.0.0.0/0
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
         - IpProtocol: tcp
           FromPort: 10051
           ToPort: 10051
-          CidrIp: 0.0.0.0/0
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS database
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ECSServiceSecurityGroup
+
+  # ---------------- Application Load Balancer ----------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ZabbixTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-web-tg'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  ZabbixListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ZabbixTargetGroup
+
+  # ---------------- ECS ----------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}-cluster'
 
   # ---------------- Database ----------------
   DBSecret:
@@ -156,7 +258,7 @@ Resources:
       MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref DBSecret, ':SecretString:password}}' ]]
       DBName: !Ref DatabaseName
       VPCSecurityGroups:
-        - !Ref ECSServiceSecurityGroup
+        - !Ref DatabaseSecurityGroup
       DBSubnetGroupName: !Ref DBSubnetGroup
 
   # ---------------- IAM ----------------
@@ -172,8 +274,15 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
-        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+      Policies:
+        - PolicyName: SecretsManagerReadAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DBSecret
 
   # ---------------- Logs ----------------
   ZabbixServerLogGroup:
@@ -206,15 +315,15 @@ Resources:
             - { ContainerPort: 10051, Protocol: tcp }
           Environment:
             - { Name: DB_SERVER_HOST, Value: !GetAtt ZabbixDatabase.Endpoint.Address }
-            - { Name: POSTGRES_DB, Value: zabbix }
+            - { Name: POSTGRES_DB, Value: !Ref DatabaseName }
             - { Name: ZBX_HISTORYSTORAGETYPES, Value: "log,text" }
             - { Name: ZBX_DEBUGLEVEL, Value: '3' }
             - { Name: ZBX_TIMEOUT, Value: '4' }
           Secrets:
             - Name: POSTGRES_USER
-              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBSecret}:username::'
+              ValueFrom: !Sub '${DBSecret}:username::'
             - Name: POSTGRES_PASSWORD
-              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBSecret}:password::'
+              ValueFrom: !Sub '${DBSecret}:password::'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -245,12 +354,13 @@ Resources:
             - { ContainerPort: 80, Protocol: tcp }
           Environment:
             - { Name: DB_SERVER_HOST, Value: !GetAtt ZabbixDatabase.Endpoint.Address }
-            - { Name: POSTGRES_DB, Value: zabbix }
+            - { Name: POSTGRES_DB, Value: !Ref DatabaseName }
+            - { Name: ZBX_SERVER_HOST, Value: !Sub '${ProjectName}-${Environment}-server.${ProjectName}-${Environment}-cluster.local' }
           Secrets:
             - Name: POSTGRES_USER
-              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBSecret}:username::'
+              ValueFrom: !Sub '${DBSecret}:username::'
             - Name: POSTGRES_PASSWORD
-              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBSecret}:password::'
+              ValueFrom: !Sub '${DBSecret}:password::'
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -274,16 +384,17 @@ Resources:
       DesiredCount: 1
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
+          AssignPublicIp: DISABLED
           Subnets:
-            - !Ref PublicSubnetA
-            - !Ref PublicSubnetB
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
           SecurityGroups:
             - !Ref ECSServiceSecurityGroup
       TaskDefinition: !Ref ZabbixServerTaskDefinition
 
   ZabbixWebService:
     Type: AWS::ECS::Service
+    DependsOn: ZabbixListener
     Properties:
       ServiceName: !Sub '${ProjectName}-${Environment}-web'
       Cluster: !Ref ECSCluster
@@ -291,15 +402,22 @@ Resources:
       DesiredCount: 1
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
+          AssignPublicIp: DISABLED
           Subnets:
-            - !Ref PublicSubnetA
-            - !Ref PublicSubnetB
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
           SecurityGroups:
             - !Ref ECSServiceSecurityGroup
       TaskDefinition: !Ref ZabbixWebTaskDefinition
+      LoadBalancers:
+        - ContainerName: zabbix-web
+          ContainerPort: 80
+          TargetGroupArn: !Ref ZabbixTargetGroup
 
 Outputs:
+  LoadBalancerURL:
+    Description: URL of the Application Load Balancer
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
   ECSClusterName:
     Description: Name of the ECS Cluster
     Value: !Ref ECSCluster

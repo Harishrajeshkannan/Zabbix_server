@@ -129,7 +129,7 @@ Resources:
           Environment:
             - { Name: DB_SERVER_HOST, Value: !GetAtt ZabbixDatabase.Endpoint.Address }
             - { Name: POSTGRES_DB, Value: zabbix }
-            - { Name: ZBX_HISTORYSTORAGETYPES, Value: log,text }
+            - { Name: ZBX_HISTORYSTORAGETYPES, Value: "log,text" }
             - { Name: ZBX_DEBUGLEVEL, Value: '3' }
             - { Name: ZBX_TIMEOUT, Value: '4' }
           Secrets:

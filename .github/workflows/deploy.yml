@@ -40,6 +40,7 @@ jobs:
             echo "environment=dev" >> $GITHUB_OUTPUT
           else
             echo "environment=dev" >> $GITHUB_OUTPUT
+          fi   # ✅ missing in your version
 
   validate:
     needs: determine-environment

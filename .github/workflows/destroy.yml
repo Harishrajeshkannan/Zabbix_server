@@ -1,0 +1,50 @@
+name: Destroy Zabbix Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        options: [ dev, staging ]
+      confirm_destroy:
+        description: 'Type DELETE to confirm'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: zabbix
+
+jobs:
+  destroy:
+    if: github.event.inputs.confirm_destroy == 'DELETE'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete CloudFormation stack
+        run: |
+          STACK_NAME="${PROJECT_NAME}-${{ github.event.inputs.environment }}"
+          echo "Deleting stack: $STACK_NAME"
+          if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+            echo "✅ Deleted $STACK_NAME"
+          else
+            echo "ℹ️ Stack $STACK_NAME not found"
+          fi
+
+      - name: Cleanup orphans
+        run: |
+          chmod +x scripts/cleanup.sh
+          ./scripts/cleanup.sh "${{ github.event.inputs.environment }}"

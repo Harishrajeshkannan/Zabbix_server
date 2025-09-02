@@ -1,0 +1,558 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Complete Zabbix ECS Fargate infrastructure with PostgreSQL RDS backend'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: zabbix
+    Description: Project name for resource naming
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for VPC
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium, db.t3.large]
+    Description: RDS instance class
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: RDS allocated storage (GB)
+
+  ECSTaskCpu:
+    Type: Number
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: CPU units for ECS tasks
+
+  ECSTaskMemory:
+    Type: Number
+    Default: 1024
+    AllowedValues: [512, 1024, 2048, 4096, 8192, 16384]
+    Description: Memory for ECS tasks (MB)
+
+  ZabbixServerImage:
+    Type: String
+    Default: zabbix/zabbix-server-pgsql:6.4-alpine
+    Description: Zabbix server Docker image
+
+  ZabbixWebImage:
+    Type: String
+    Default: zabbix/zabbix-web-apache-pgsql:6.4-alpine
+    Description: Zabbix web Docker image
+
+  SSLCertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM cert ARN for HTTPS (optional)
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  HasSSLCertificate: !Not [!Equals [!Ref SSLCertificateArn, ""]]
+
+Resources:
+  # ---------------- VPC & Networking ----------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-vpc' }
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-1' }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-2' }
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-1' }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-2' }
+
+  DBSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-db-1' }
+
+  DBSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-db-2' }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-igw' }
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  EIPForNAT1:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NATGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPForNAT1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-nat-1' }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-rt' }
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-rt' }
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------- Security Groups ----------------
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80,  ToPort: 80,  CidrIp: 0.0.0.0/0, Description: HTTP }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-alb-sg' }
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Web access from ALB
+        - IpProtocol: tcp
+          FromPort: 10051
+          ToPort: 10051
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+          Description: Zabbix server communication
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-ecs-sg' }
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for RDS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+          Description: PostgreSQL from ECS tasks
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-db-sg' }
+
+  # ---------------- Database ----------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for RDS
+      SubnetIds: [!Ref DBSubnet1, !Ref DBSubnet2]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-db-subnet-group' }
+
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-db-credentials'
+      Description: DB credentials for Zabbix
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "zabbix"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\'
+
+  ZabbixDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${Environment}-db'
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: '15.4'
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+      DBName: zabbix
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:password}}'
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: !If [IsProd, 7, 1]
+      MultiAZ: !If [IsProd, true, false]
+      PubliclyAccessible: false
+      EnableCloudwatchLogsExports: [postgresql]
+      DeletionProtection: !If [IsProd, true, false]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-db' }
+
+  # ---------------- ECS Cluster & Roles ----------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}-cluster'
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy:
+        - { CapacityProvider: FARGATE, Weight: 1 }
+        - { CapacityProvider: FARGATE_SPOT, Weight: !If [IsProd, 0, 1] }
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-cluster' }
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-exec'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccessForTasks
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['secretsmanager:GetSecretValue']
+                Resource: !Ref DBSecret
+
+  # ---------------- CloudWatch Logs ----------------
+  ZabbixServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}-server'
+      RetentionInDays: !If [IsProd, 30, 7]
+
+  ZabbixWebLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}-web'
+      RetentionInDays: !If [IsProd, 30, 7]
+
+  # ---------------- Service Discovery (Cloud Map) ----------------
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}.local'
+      Vpc: !Ref VPC
+      Description: Private namespace for service discovery
+
+  ZabbixServerServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: zabbix-server
+      NamespaceId: !Ref ServiceDiscoveryNamespace
+      DnsConfig:
+        DnsRecords:
+          - { Type: A, TTL: 10 }
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # ---------------- Task Definitions ----------------
+  ZabbixServerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-server'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !Ref ECSTaskCpu
+      Memory: !Ref ECSTaskMemory
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      ContainerDefinitions:
+        - Name: zabbix-server
+          Image: !Ref ZabbixServerImage
+          Essential: true
+          PortMappings:
+            - { ContainerPort: 10051, Protocol: tcp }
+          Environment:
+            - { Name: DB_SERVER_HOST, Value: !GetAtt ZabbixDatabase.Endpoint.Address }
+            - { Name: POSTGRES_DB,   Value: zabbix }
+            - { Name: ZBX_HISTORYSTORAGETYPES, Value: log,text }
+            - { Name: ZBX_DEBUGLEVEL, Value: '3' }
+            - { Name: ZBX_TIMEOUT,    Value: '4' }
+          Secrets:
+            - Name: POSTGRES_USER
+              ValueFrom: !Sub '${DBSecret}:username::'
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub '${DBSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ZabbixServerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command: [ "CMD-SHELL", "nc -z localhost 10051 || exit 1" ]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  ZabbixWebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-web'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !Ref ECSTaskCpu
+      Memory: !Ref ECSTaskMemory
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      ContainerDefinitions:
+        - Name: zabbix-web
+          Image: !Ref ZabbixWebImage
+          Essential: true
+          PortMappings:
+            - { ContainerPort: 8080, Protocol: tcp }
+          Environment:
+            - { Name: ZBX_SERVER_HOST, Value: !Sub 'zabbix-server.${ProjectName}-${Environment}.local' }
+            - { Name: DB_SERVER_HOST, Value: !GetAtt ZabbixDatabase.Endpoint.Address }
+            - { Name: POSTGRES_DB,    Value: zabbix }
+            - { Name: PHP_TZ,         Value: UTC }
+          Secrets:
+            - Name: POSTGRES_USER
+              ValueFrom: !Sub '${DBSecret}:username::'
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub '${DBSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ZabbixWebLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command: [ "CMD-SHELL", "wget -qO- http://localhost:8080/ >/dev/null 2>&1 || exit 1" ]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  # ---------------- Load Balancer ----------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      SecurityGroups: [!Ref ALBSecurityGroup]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-alb' }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-tg'
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-tg' }
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasSSLCertificate
+          - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasSSLCertificate
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates: [ { CertificateArn: !Ref SSLCertificateArn } ]
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------- ECS Services ----------------
+  ZabbixServerECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-server'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ZabbixServerTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: [!Ref ECSSecurityGroup]
+          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ZabbixServerServiceDiscovery.Arn
+
+  ZabbixWebECSService:
+    Type: AWS::ECS::Service
+    DependsOn: [HTTPListener, ZabbixServerECSService]
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-web'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ZabbixWebTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: [!Ref ECSSecurityGroup]
+          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      LoadBalancers:
+        - ContainerName: zabbix-web
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name of the ALB
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  LoadBalancerURL:
+    Description: Zabbix Web URL
+    Value: !Sub
+      - '${Proto}://${DNS}'
+      - { Proto: !If [HasSSLCertificate, 'https', 'http'], DNS: !GetAtt ApplicationLoadBalancer.DNSName ] }
+
+  DatabaseEndpoint:
+    Description: RDS endpoint
+    Value: !GetAtt ZabbixDatabase.Endpoint.Address
+
+  ECSClusterArn:
+    Description: ECS Cluster ARN
+    Value: !Ref ECSCluster

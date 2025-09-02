@@ -1,0 +1,57 @@
+name: Infrastructure Drift Detection
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # daily at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to check'
+        required: true
+        default: 'prod'
+        type: choice
+        options: [ dev, staging, prod ]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: zabbix
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        envs: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', github.event.inputs.environment)) || fromJson('["dev","staging","prod"]') }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Detect drift
+        id: drift
+        run: |
+          STACK_NAME="${PROJECT_NAME}-${{ matrix.envs }}"
+          if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+            echo "Stack $STACK_NAME does not exist, skipping."
+            echo "stack-exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "stack-exists=true" >> $GITHUB_OUTPUT
+          DRIFT_ID=$(aws cloudformation detect-stack-drift --stack-name "$STACK_NAME" --query 'StackDriftDetectionId' --output text)
+          aws cloudformation wait stack-drift-detection-complete --stack-drift-detection-id "$DRIFT_ID"
+          STATUS=$(aws cloudformation describe-stack-drift-detection-status --stack-drift-detection-id "$DRIFT_ID" --query 'StackDriftStatus' --output text)
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "Drift status for $STACK_NAME: $STATUS"
+
+      - name: List drifted resources
+        if: steps.drift.outputs.status == 'DRIFTED'
+        run: |
+          STACK_NAME="${PROJECT_NAME}-${{ matrix.envs }}"
+          aws cloudformation describe-stack-resource-drifts \
+            --stack-name "$STACK_NAME" \
+            --stack-resource-drift-status-filters MODIFIED DELETED \
+            --query 'StackResourceDrifts[*].[LogicalResourceId,ResourceType,StackResourceDriftStatus]' \
+            --output table

@@ -1,0 +1,7 @@
+[
+  { "ParameterKey": "Environment", "ParameterValue": "dev" },
+  { "ParameterKey": "DBInstanceClass", "ParameterValue": "db.t3.micro" },
+  { "ParameterKey": "DBAllocatedStorage", "ParameterValue": "20" },
+  { "ParameterKey": "ECSTaskCpu", "ParameterValue": "512" },
+  { "ParameterKey": "ECSTaskMemory", "ParameterValue": "1024" }
+]

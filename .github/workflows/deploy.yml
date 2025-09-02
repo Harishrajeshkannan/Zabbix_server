@@ -1,0 +1,144 @@
+name: Deploy Zabbix Infrastructure
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'cloudformation/**'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'cloudformation/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [ dev, staging, prod ]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: zabbix
+
+jobs:
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+    steps:
+      - name: Determine environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+
+  validate:
+    needs: determine-environment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate CloudFormation template syntax
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://cloudformation/infrastructure.yaml
+          echo "✅ Template passed validation"
+
+  deploy:
+    needs: [determine-environment, validate]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack
+        id: deploy
+        run: |
+          ENV="${{ needs.determine-environment.outputs.environment }}"
+          STACK_NAME="${PROJECT_NAME}-${ENV}"
+
+          PARAM_FILE="cloudformation/parameters/${ENV}.json"
+          echo "Deploying stack: $STACK_NAME (params: $PARAM_FILE)"
+
+          aws cloudformation deploy \
+            --template-file cloudformation/infrastructure.yaml \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides file://"$PARAM_FILE" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --tags Environment="$ENV" Project="$PROJECT_NAME"
+
+          echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
+
+      - name: Get deployment outputs
+        id: outputs
+        run: |
+          STACK_NAME="${{ steps.deploy.outputs.stack-name }}"
+          LOAD_BALANCER_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          DATABASE_ENDPOINT=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`DatabaseEndpoint`].OutputValue' \
+            --output text)
+          echo "load-balancer-url=$LOAD_BALANCER_URL" >> $GITHUB_OUTPUT
+          echo "database-endpoint=$DATABASE_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "ALB URL: $LOAD_BALANCER_URL"
+          echo "DB Endpoint: $DATABASE_ENDPOINT"
+
+      - name: Wait for ECS services to stabilize
+        run: |
+          ENV="${{ needs.determine-environment.outputs.environment }}"
+          CLUSTER="${PROJECT_NAME}-${ENV}-cluster"
+          aws ecs wait services-stable --cluster "$CLUSTER" \
+            --services "${PROJECT_NAME}-${ENV}-server" "${PROJECT_NAME}-${ENV}-web"
+          echo "✅ ECS services are stable"
+
+      - name: Validate Zabbix web
+        run: |
+          chmod +x scripts/validate-deployment.sh
+          ./scripts/validate-deployment.sh "${{ steps.outputs.outputs.load-balancer-url }}"
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ needs.determine-environment.outputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Stack | ${{ steps.deploy.outputs.stack-name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Zabbix URL | ${{ steps.outputs.outputs.load-balancer-url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| DB Endpoint | ${{ steps.outputs.outputs.database-endpoint }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: On failure show recent stack events
+        if: failure()
+        run: |
+          aws cloudformation describe-stack-events \
+            --stack-name "${{ steps.deploy.outputs.stack-name }}" \
+            --max-items 25 \
+            --query 'StackEvents[*].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]' \
+            --output table

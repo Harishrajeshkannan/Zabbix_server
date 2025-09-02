@@ -1,0 +1,7 @@
+[
+  { "ParameterKey": "Environment", "ParameterValue": "staging" },
+  { "ParameterKey": "DBInstanceClass", "ParameterValue": "db.t3.small" },
+  { "ParameterKey": "DBAllocatedStorage", "ParameterValue": "50" },
+  { "ParameterKey": "ECSTaskCpu", "ParameterValue": "1024" },
+  { "ParameterKey": "ECSTaskMemory", "ParameterValue": "2048" }
+]

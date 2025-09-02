@@ -2,12 +2,6 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: ECS Fargate cluster with Zabbix, PostgreSQL, and Nginx on AWS
 
 Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: The VPC ID to deploy resources into
-  Subnets:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: A list of subnet IDs for the ECS tasks
   ProjectName:
     Type: String
     Default: zabbix
@@ -34,6 +28,84 @@ Parameters:
     Default: zabbix
 
 Resources:
+  # ---------------- VPC ----------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------- ECS ----------------
   ECSCluster:
     Type: AWS::ECS::Cluster
     Properties:
@@ -43,7 +115,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Security group for ECS services
-      VpcId: !Ref VpcId
+      VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
@@ -54,6 +126,7 @@ Resources:
           ToPort: 10051
           CidrIp: 0.0.0.0/0
 
+  # ---------------- Database ----------------
   DBSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
@@ -63,6 +136,14 @@ Resources:
         SecretStringTemplate: '{"username": "zabbix"}'
         GenerateStringKey: password
         ExcludeCharacters: '"@/\'
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Zabbix DB
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
 
   ZabbixDatabase:
     Type: AWS::RDS::DBInstance
@@ -78,12 +159,7 @@ Resources:
         - !Ref ECSServiceSecurityGroup
       DBSubnetGroupName: !Ref DBSubnetGroup
 
-  DBSubnetGroup:
-    Type: AWS::RDS::DBSubnetGroup
-    Properties:
-      DBSubnetGroupDescription: Subnet group for Zabbix DB
-      SubnetIds: !Ref Subnets
-
+  # ---------------- IAM ----------------
   ECSTaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -99,6 +175,7 @@ Resources:
         - arn:aws:iam::aws:policy/AmazonRDSFullAccess
         - arn:aws:iam::aws:policy/SecretsManagerReadWrite
 
+  # ---------------- Logs ----------------
   ZabbixServerLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -111,6 +188,7 @@ Resources:
       LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}-web'
       RetentionInDays: 7
 
+  # ---------------- ECS Task Definitions ----------------
   ZabbixServerTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
@@ -186,6 +264,7 @@ Resources:
             Retries: 3
             StartPeriod: 60
 
+  # ---------------- ECS Services ----------------
   ZabbixServerService:
     Type: AWS::ECS::Service
     Properties:
@@ -196,7 +275,9 @@ Resources:
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
-          Subnets: !Ref Subnets
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
           SecurityGroups:
             - !Ref ECSServiceSecurityGroup
       TaskDefinition: !Ref ZabbixServerTaskDefinition
@@ -211,7 +292,9 @@ Resources:
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
-          Subnets: !Ref Subnets
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
           SecurityGroups:
             - !Ref ECSServiceSecurityGroup
       TaskDefinition: !Ref ZabbixWebTaskDefinition
@@ -229,3 +312,12 @@ Outputs:
   DatabaseEndpoint:
     Description: RDS Database Endpoint
     Value: !GetAtt ZabbixDatabase.Endpoint.Address
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+  PublicSubnets:
+    Description: Public subnets
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+  PrivateSubnets:
+    Description: Private subnets
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
